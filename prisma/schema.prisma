@@ -31,8 +31,12 @@ model DomainListing {
   pricingPeriod          PricingPeriod      @default(MONTHLY) @map("pricing_period")
   registrar              Registrar
   apiCredentialsEncrypted String           @map("api_credentials_encrypted")
+  zoneId                 String?            @map("zone_id") // For Cloudflare zone ID or Route53 hosted zone ID
+  allowedRecordTypes     DnsRecordType[]    @map("allowed_record_types")
   maxSubdomainsAllowed   Int                @map("max_subdomains_allowed")
   status                 ListingStatus      @default(ACTIVE)
+  isVerified             Boolean            @default(false) @map("is_verified")
+  verificationToken      String?            @map("verification_token")
   createdAt              DateTime           @default(now()) @map("created_at")
 
   // Relations

@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { encrypt } from '@/lib/encryption';
+import { randomBytes } from 'crypto';
+import { validateCredentials } from '@/lib/dns';
 
 // GET /api/listings - Browse available domains
 export async function GET(request: NextRequest) {
@@ -71,7 +73,8 @@ export async function POST(request: NextRequest) {
       pricePerSubdomain,
       pricingPeriod,
       registrar,
-      apiCredentials,
+      apiCredentials, // { apiToken, zoneId } for Cloudflare, etc.
+      allowedRecordTypes, // ['A', 'CNAME', 'TXT']
       maxSubdomainsAllowed,
     } = body;
 
@@ -83,10 +86,46 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Validate allowed record types
+    if (!allowedRecordTypes || !Array.isArray(allowedRecordTypes) || allowedRecordTypes.length === 0) {
+      return NextResponse.json(
+        { error: 'allowedRecordTypes must be a non-empty array' },
+        { status: 400 }
+      );
+    }
+
+    const validRecordTypes = ['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS'];
+    const invalidTypes = allowedRecordTypes.filter((type: string) => !validRecordTypes.includes(type));
+    if (invalidTypes.length > 0) {
+      return NextResponse.json(
+        { error: `Invalid record types: ${invalidTypes.join(', ')}` },
+        { status: 400 }
+      );
+    }
+
     // Encrypt API credentials
     const encryptedCredentials = encrypt(JSON.stringify(apiCredentials));
 
-    // Create listing
+    // Validate API credentials by attempting to connect
+    const credentialsValid = await validateCredentials(
+      registrar.toUpperCase(),
+      encryptedCredentials
+    );
+
+    if (!credentialsValid.valid) {
+      return NextResponse.json(
+        { error: `Invalid API credentials: ${credentialsValid.error}` },
+        { status: 400 }
+      );
+    }
+
+    // Generate verification token (random 32-byte hex string)
+    const verificationToken = randomBytes(32).toString('hex');
+
+    // Extract zoneId from credentials if available (for Cloudflare/Route53)
+    const zoneId = apiCredentials.zoneId || apiCredentials.hostedZoneId || null;
+
+    // Create listing with unverified status
     const listing = await prisma.domainListing.create({
       data: {
         userId,
@@ -95,7 +134,11 @@ export async function POST(request: NextRequest) {
         pricingPeriod: pricingPeriod || 'MONTHLY',
         registrar: registrar.toUpperCase(),
         apiCredentialsEncrypted: encryptedCredentials,
+        zoneId,
+        allowedRecordTypes,
         maxSubdomainsAllowed,
+        isVerified: false,
+        verificationToken,
       },
       include: {
         user: {
@@ -107,13 +150,29 @@ export async function POST(request: NextRequest) {
       },
     });
 
-    // Don't expose encrypted credentials in response
-    const sanitizedListing = {
-      ...listing,
-      apiCredentialsEncrypted: undefined,
+    // Return response with verification instructions
+    const response = {
+      id: listing.id,
+      domainName: listing.domainName,
+      pricePerSubdomain: listing.pricePerSubdomain,
+      pricingPeriod: listing.pricingPeriod,
+      registrar: listing.registrar,
+      allowedRecordTypes: listing.allowedRecordTypes,
+      maxSubdomainsAllowed: listing.maxSubdomainsAllowed,
+      isVerified: listing.isVerified,
+      verificationToken: listing.verificationToken,
+      verificationInstructions: {
+        message: 'To verify domain ownership, add a TXT record to your domain with the following details:',
+        recordType: 'TXT',
+        recordName: '_domain-verification',
+        recordValue: verificationToken,
+        nextStep: `After adding the TXT record, call POST /api/listings/${listing.id}/verify to complete verification.`,
+      },
+      user: listing.user,
+      createdAt: listing.createdAt,
     };
 
-    return NextResponse.json(sanitizedListing, { status: 201 });
+    return NextResponse.json(response, { status: 201 });
   } catch (error: any) {
     console.error('Error creating listing:', error);
 

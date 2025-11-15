@@ -94,41 +94,55 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Calculate dates
-    const rentalPeriodStart = new Date();
-    const rentalPeriodEnd = new Date();
-
-    if (listing.pricingPeriod === 'MONTHLY') {
-      rentalPeriodEnd.setMonth(rentalPeriodEnd.getMonth() + rentalPeriodMonths);
-    } else {
-      rentalPeriodEnd.setFullYear(rentalPeriodEnd.getFullYear() + 1);
-    }
-
     const fullDomain = `${subdomain}.${listing.domainName}`;
 
-    // Calculate amount
-    const amount = Number(listing.pricePerSubdomain) * (listing.pricingPeriod === 'MONTHLY' ? rentalPeriodMonths : 1);
+    // Calculate amount in cents
+    const amount = Math.round(Number(listing.pricePerSubdomain) * 100);
 
-    // Create Stripe checkout session
+    // Determine subscription interval
+    const interval: 'month' | 'year' = listing.pricingPeriod === 'MONTHLY' ? 'month' : 'year';
+
+    // Get or create Stripe customer
+    let customerId = renter.stripeCustomerId;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: renter.email,
+        metadata: {
+          userId: renter.id,
+        },
+      });
+      customerId = customer.id;
+
+      // Update user with Stripe customer ID
+      await prisma.user.update({
+        where: { id: renter.id },
+        data: { stripeCustomerId: customerId },
+      });
+    }
+
+    // Create Stripe checkout session with subscription mode
     const session = await stripe.checkout.sessions.create({
+      customer: customerId,
       payment_method_types: ['card'],
       line_items: [
         {
           price_data: {
             currency: 'usd',
             product_data: {
-              name: `Subdomain Rental: ${fullDomain}`,
-              description: `${listing.pricingPeriod.toLowerCase()} rental`,
+              name: `Subdomain: ${fullDomain}`,
+              description: `${listing.pricingPeriod.toLowerCase()} subdomain rental`,
             },
-            unit_amount: Math.round(amount * 100), // Convert to cents
+            unit_amount: amount,
+            recurring: {
+              interval,
+            },
           },
           quantity: 1,
         },
       ],
-      mode: 'payment',
-      success_url: `${process.env.NEXT_PUBLIC_APP_URL}/rentals/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.NEXT_PUBLIC_APP_URL}/listings/${listingId}`,
-      customer_email: renter.email,
+      mode: 'subscription',
+      success_url: `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/rentals/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/listings/${listingId}`,
       metadata: {
         listingId,
         renterUserId,
@@ -136,8 +150,6 @@ export async function POST(request: NextRequest) {
         fullDomain,
         dnsRecordType,
         dnsRecordValue,
-        rentalPeriodStart: rentalPeriodStart.toISOString(),
-        rentalPeriodEnd: rentalPeriodEnd.toISOString(),
       },
     });
 

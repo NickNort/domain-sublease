@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { createDNSProvider } from '@/lib/dns';
 
 // POST /api/check-availability - Check if subdomain is available
 export async function POST(request: NextRequest) {
@@ -70,7 +71,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Check if subdomain is already taken
+    // Check if subdomain is already taken in database
     const existingRental = await prisma.subdomainRental.findFirst({
       where: {
         listingId,
@@ -89,12 +90,55 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Check DNS records to ensure subdomain doesn't already exist
+    // This prevents conflicts with manually created records
+    const fullDomain = `${subdomain}.${listing.domainName}`;
+
+    if (listing.isVerified) {
+      try {
+        const dnsProvider = createDNSProvider(
+          listing.registrar,
+          listing.apiCredentialsEncrypted
+        );
+
+        const dnsResult = await dnsProvider.listRecords();
+
+        if (dnsResult.success && dnsResult.records) {
+          // Check if any DNS record exists for this subdomain
+          const conflictingRecord = dnsResult.records.find((record: any) => {
+            const recordName = record.name || record.Name;
+            // Check for exact match or if the record name contains our subdomain
+            return (
+              recordName === fullDomain ||
+              recordName === `${subdomain}.${listing.domainName}.` || // With trailing dot
+              recordName.startsWith(`${subdomain}.`)
+            );
+          });
+
+          if (conflictingRecord) {
+            return NextResponse.json(
+              {
+                available: false,
+                reason: 'A DNS record already exists for this subdomain. Please choose a different name.',
+              },
+              { status: 200 }
+            );
+          }
+        }
+      } catch (dnsError) {
+        console.error('Error checking DNS records:', dnsError);
+        // Don't fail the availability check if DNS lookup fails
+        // The subdomain might still be available
+      }
+    }
+
     // Subdomain is available
     return NextResponse.json({
       available: true,
-      fullDomain: `${subdomain}.${listing.domainName}`,
+      fullDomain,
       price: listing.pricePerSubdomain,
       pricingPeriod: listing.pricingPeriod,
+      allowedRecordTypes: listing.allowedRecordTypes,
     });
   } catch (error) {
     console.error('Error checking availability:', error);

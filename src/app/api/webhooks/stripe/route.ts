@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import Stripe from 'stripe';
+import { createDNSProvider } from '@/lib/dns';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
   apiVersion: '2025-01-27.acacia',
@@ -81,17 +82,79 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
       fullDomain,
       dnsRecordType,
       dnsRecordValue,
-      rentalPeriodStart,
-      rentalPeriodEnd,
     } = metadata;
 
-    // Get the payment intent to get amount
+    // Get the subscription to determine pricing and period
     let amount = 0;
-    if (session.payment_intent) {
-      const paymentIntent = await stripe.paymentIntents.retrieve(
-        session.payment_intent as string
+    let subscriptionId: string | null = null;
+    let rentalPeriodStart = new Date();
+    let rentalPeriodEnd = new Date();
+
+    if (session.subscription) {
+      const subscription = await stripe.subscriptions.retrieve(
+        session.subscription as string
       );
-      amount = paymentIntent.amount / 100; // Convert from cents
+
+      subscriptionId = subscription.id;
+
+      // Get amount from subscription
+      if (subscription.items.data[0]) {
+        amount = (subscription.items.data[0].price.unit_amount || 0) / 100;
+      }
+
+      // Calculate rental period based on subscription
+      rentalPeriodStart = new Date(subscription.current_period_start * 1000);
+      rentalPeriodEnd = new Date(subscription.current_period_end * 1000);
+    }
+
+    // Get listing with credentials
+    const listing = await prisma.domainListing.findUnique({
+      where: { id: listingId },
+    });
+
+    if (!listing) {
+      console.error('Listing not found:', listingId);
+      return;
+    }
+
+    // Check if listing is verified
+    if (!listing.isVerified) {
+      console.error('Cannot create DNS record for unverified listing:', listingId);
+      return;
+    }
+
+    // Check if DNS record type is allowed
+    if (!listing.allowedRecordTypes.includes(dnsRecordType as any)) {
+      console.error(`DNS record type ${dnsRecordType} not allowed for listing ${listingId}`);
+      return;
+    }
+
+    // Create DNS record
+    let dnsRecordId: string | null = null;
+    try {
+      const dnsProvider = createDNSProvider(
+        listing.registrar,
+        listing.apiCredentialsEncrypted
+      );
+
+      const recordResult = await dnsProvider.createRecord({
+        type: dnsRecordType as any,
+        name: fullDomain,
+        content: dnsRecordValue,
+        ttl: 3600,
+      });
+
+      if (recordResult.success) {
+        dnsRecordId = recordResult.recordId || null;
+        console.log('DNS record created successfully:', dnsRecordId);
+      } else {
+        console.error('Failed to create DNS record:', recordResult.error);
+        // Don't throw - we still want to create the rental record
+        // The user can manually update DNS or we can retry later
+      }
+    } catch (dnsError) {
+      console.error('Error creating DNS record:', dnsError);
+      // Continue with rental creation
     }
 
     // Create rental record
@@ -103,22 +166,24 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
         fullDomain,
         dnsRecordType: dnsRecordType as any,
         dnsRecordValue,
-        rentalPeriodStart: new Date(rentalPeriodStart),
-        rentalPeriodEnd: new Date(rentalPeriodEnd),
+        rentalPeriodStart,
+        rentalPeriodEnd,
         status: 'ACTIVE',
-        stripeSubscriptionId: session.subscription as string | null,
+        stripeSubscriptionId: subscriptionId,
       },
     });
 
     // Create transaction record
-    await prisma.transaction.create({
-      data: {
-        rentalId: rental.id,
-        amount,
-        stripePaymentIntentId: session.payment_intent as string,
-        status: 'COMPLETED',
-      },
-    });
+    if (session.payment_intent) {
+      await prisma.transaction.create({
+        data: {
+          rentalId: rental.id,
+          amount,
+          stripePaymentIntentId: session.payment_intent as string,
+          status: 'COMPLETED',
+        },
+      });
+    }
 
     console.log('Rental created successfully:', rental.id);
   } catch (error) {
@@ -186,16 +251,62 @@ async function handleSubscriptionDeleted(subscription: Stripe.Subscription) {
       where: {
         stripeSubscriptionId: subscription.id,
       },
+      include: {
+        listing: true,
+      },
     });
 
-    if (rental) {
-      await prisma.subdomainRental.update({
-        where: { id: rental.id },
-        data: { status: 'CANCELLED' },
-      });
+    if (!rental) {
+      console.log('No rental found for subscription:', subscription.id);
+      return;
     }
 
-    console.log('Subscription deleted:', subscription.id);
+    // Delete DNS record if listing is verified
+    if (rental.listing.isVerified) {
+      try {
+        const dnsProvider = createDNSProvider(
+          rental.listing.registrar,
+          rental.listing.apiCredentialsEncrypted
+        );
+
+        // For deletion, we need the record ID
+        // Since we don't store it, we'll need to find it by name and type
+        const listResult = await dnsProvider.listRecords(rental.dnsRecordType);
+
+        if (listResult.success && listResult.records) {
+          // Find the record matching our subdomain
+          const recordToDelete = listResult.records.find((record: any) => {
+            // Different providers have different response formats
+            const recordName = record.name || record.Name;
+            return recordName === rental.fullDomain || recordName.startsWith(rental.subdomain);
+          });
+
+          if (recordToDelete) {
+            const recordId = recordToDelete.id || recordToDelete.Id || `${rental.fullDomain}:${rental.dnsRecordType}`;
+            const deleteResult = await dnsProvider.deleteRecord(recordId);
+
+            if (deleteResult.success) {
+              console.log('DNS record deleted successfully for:', rental.fullDomain);
+            } else {
+              console.error('Failed to delete DNS record:', deleteResult.error);
+            }
+          } else {
+            console.log('DNS record not found for deletion:', rental.fullDomain);
+          }
+        }
+      } catch (dnsError) {
+        console.error('Error deleting DNS record:', dnsError);
+        // Continue with rental cancellation even if DNS deletion fails
+      }
+    }
+
+    // Update rental status
+    await prisma.subdomainRental.update({
+      where: { id: rental.id },
+      data: { status: 'CANCELLED' },
+    });
+
+    console.log('Subscription deleted and rental cancelled:', subscription.id);
   } catch (error) {
     console.error('Error handling subscription deleted:', error);
     throw error;
