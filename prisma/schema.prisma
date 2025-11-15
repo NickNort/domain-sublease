@@ -1,0 +1,119 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                String             @id @default(cuid())
+  email             String             @unique
+  stripeCustomerId  String?            @map("stripe_customer_id")
+  createdAt         DateTime           @default(now()) @map("created_at")
+
+  // Relations
+  domainListings    DomainListing[]
+  subdomainRentals  SubdomainRental[]
+
+  @@map("users")
+}
+
+model DomainListing {
+  id                     String             @id @default(cuid())
+  userId                 String             @map("user_id")
+  domainName             String             @unique @map("domain_name")
+  pricePerSubdomain      Decimal            @map("price_per_subdomain") @db.Decimal(10, 2)
+  pricingPeriod          PricingPeriod      @default(MONTHLY) @map("pricing_period")
+  registrar              Registrar
+  apiCredentialsEncrypted String           @map("api_credentials_encrypted")
+  maxSubdomainsAllowed   Int                @map("max_subdomains_allowed")
+  status                 ListingStatus      @default(ACTIVE)
+  createdAt              DateTime           @default(now()) @map("created_at")
+
+  // Relations
+  user                   User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subdomainRentals       SubdomainRental[]
+
+  @@map("domain_listings")
+}
+
+model SubdomainRental {
+  id                   String            @id @default(cuid())
+  listingId            String            @map("listing_id")
+  renterUserId         String            @map("renter_user_id")
+  subdomain            String
+  fullDomain           String            @map("full_domain")
+  dnsRecordType        DnsRecordType     @map("dns_record_type")
+  dnsRecordValue       String            @map("dns_record_value")
+  rentalPeriodStart    DateTime          @map("rental_period_start")
+  rentalPeriodEnd      DateTime          @map("rental_period_end")
+  status               RentalStatus      @default(ACTIVE)
+  stripeSubscriptionId String?           @map("stripe_subscription_id")
+  createdAt            DateTime          @default(now()) @map("created_at")
+
+  // Relations
+  listing              DomainListing     @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  renter               User              @relation(fields: [renterUserId], references: [id], onDelete: Cascade)
+  transactions         Transaction[]
+
+  @@unique([listingId, subdomain])
+  @@map("subdomain_rentals")
+}
+
+model Transaction {
+  id                    String            @id @default(cuid())
+  rentalId              String            @map("rental_id")
+  amount                Decimal           @db.Decimal(10, 2)
+  stripePaymentIntentId String?           @map("stripe_payment_intent_id")
+  status                PaymentStatus     @default(PENDING)
+  createdAt             DateTime          @default(now()) @map("created_at")
+
+  // Relations
+  rental                SubdomainRental   @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+
+  @@map("transactions")
+}
+
+// Enums
+enum PricingPeriod {
+  MONTHLY
+  YEARLY
+}
+
+enum Registrar {
+  CLOUDFLARE
+  ROUTE53
+  NAMECHEAP
+}
+
+enum ListingStatus {
+  ACTIVE
+  PAUSED
+}
+
+enum DnsRecordType {
+  A
+  AAAA
+  CNAME
+  TXT
+  MX
+  NS
+}
+
+enum RentalStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
