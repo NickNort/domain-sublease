@@ -10,8 +10,9 @@
   },
   "dependencies": {
     "@daytonaio/sdk": "^0.115.0",
-    "@radix-ui/react-slot": "^1.2.4",
     "@prisma/client": "^6.19.0",
+    "@radix-ui/react-slot": "^1.2.4",
+    "@sentry/nextjs": "^10.25.0",
     "bcryptjs": "^3.0.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
